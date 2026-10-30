@@ -23,6 +23,12 @@ idf_component_register(
         "tools/tool_gpio.c"
         "tools/tool_ws2812.c"
         "tools/tool_servo.c"
+        "tools/tool_i2c.c"
+        "tools/tool_spi.c"
+        "tools/tool_uart.c"
+        "tools/tool_adc.c"
+        "tools/tool_rmt.c"
+        "tools/tool_device.c"
         "tools/gpio_policy.c"
         "skills/skill_loader.c"
         "onboard/wifi_onboard.c"
@@ -32,4 +38,5 @@ idf_component_register(
         nvs_flash esp_wifi esp_netif esp_http_client esp_http_server
         esp_https_ota esp_event json spiffs console vfs app_update esp-tls
         esp_timer esp_websocket_client esp_driver_gpio esp_driver_rmt esp_driver_ledc
+        esp_driver_i2c esp_driver_spi esp_driver_uart esp_adc
 )

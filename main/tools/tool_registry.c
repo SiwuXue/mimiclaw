@@ -7,6 +7,12 @@
 #include "tools/tool_gpio.h"
 #include "tools/tool_ws2812.h"
 #include "tools/tool_servo.h"
+#include "tools/tool_i2c.h"
+#include "tools/tool_spi.h"
+#include "tools/tool_uart.h"
+#include "tools/tool_adc.h"
+#include "tools/tool_rmt.h"
+#include "tools/tool_device.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -14,7 +20,7 @@
 
 static const char *TAG = "tools";
 
-#define MAX_TOOLS 20
+#define MAX_TOOLS 32
 
 static mimi_tool_t s_tools[MAX_TOOLS];
 static int s_tool_count = 0;
@@ -286,6 +292,161 @@ esp_err_t tool_registry_init(void)
         .execute = tool_servo_set_execute,
     };
     register_tool(&servo);
+
+    /* Register generic bus primitives (I2C / SPI / UART / ADC / RMT) */
+    tool_i2c_init();
+    tool_spi_init();
+    tool_uart_init();
+    tool_adc_init();
+    tool_rmt_init();
+
+    mimi_tool_t i2c = {
+        .name = "i2c",
+        .description = "I2C master. op=scan lists devices on the bus; op=read/op=write move hex bytes. "
+                       "Covers most sensors, RTCs and OLEDs. Default bus is SDA=8/SCL=9 at 100 kHz.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"op\":{\"type\":\"string\",\"description\":\"scan | read | write\"},"
+            "\"sda\":{\"type\":\"integer\",\"description\":\"SDA pin, default 8\"},"
+            "\"scl\":{\"type\":\"integer\",\"description\":\"SCL pin, default 9\"},"
+            "\"port\":{\"type\":\"integer\",\"description\":\"0 or 1, default 0\"},"
+            "\"freq\":{\"type\":\"integer\",\"description\":\"Clock Hz, default 100000\"},"
+            "\"addr\":{\"type\":\"integer\",\"description\":\"7-bit address, required for read/write\"},"
+            "\"reg\":{\"type\":\"string\",\"description\":\"Optional register byte in hex, e.g. \\\"0F\\\"\"},"
+            "\"data\":{\"type\":\"string\",\"description\":\"Bytes to write in hex, e.g. \\\"01 02\\\"\"},"
+            "\"len\":{\"type\":\"integer\",\"description\":\"Bytes to read, default 4 (max 32)\"}"
+            "},"
+            "\"required\":[\"op\"]}",
+        .execute = tool_i2c_execute,
+    };
+    register_tool(&i2c);
+
+    mimi_tool_t spi = {
+        .name = "spi",
+        .description = "SPI master transfer. Sends hex bytes over SPI2 and returns the received bytes.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"tx\":{\"type\":\"string\",\"description\":\"Bytes to send in hex, e.g. \\\"01 02 03\\\"\"},"
+            "\"mosi\":{\"type\":\"integer\",\"description\":\"MOSI pin, default 11\"},"
+            "\"miso\":{\"type\":\"integer\",\"description\":\"MISO pin, default 13 (omit -1 for write-only)\"},"
+            "\"sclk\":{\"type\":\"integer\",\"description\":\"SCLK pin, default 12\"},"
+            "\"cs\":{\"type\":\"integer\",\"description\":\"CS pin, default 10\"},"
+            "\"mode\":{\"type\":\"integer\",\"description\":\"SPI mode 0-3, default 0\"},"
+            "\"freq\":{\"type\":\"integer\",\"description\":\"Clock Hz, default 1000000\"},"
+            "\"bits\":{\"type\":\"integer\",\"description\":\"Optional total bit count, default 8 * byte count\"}"
+            "},"
+            "\"required\":[\"tx\"]}",
+        .execute = tool_spi_execute,
+    };
+    register_tool(&spi);
+
+    mimi_tool_t uart = {
+        .name = "uart",
+        .description = "UART1/UART2 (UART0 is the device console). op=setup binds pins and baud once, "
+                       "then op=write sends text and op=read returns received bytes as hex.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"op\":{\"type\":\"string\",\"description\":\"setup | write | read\"},"
+            "\"port\":{\"type\":\"integer\",\"description\":\"1 or 2, default 1\"},"
+            "\"tx\":{\"type\":\"integer\",\"description\":\"TX pin (setup)\"},"
+            "\"rx\":{\"type\":\"integer\",\"description\":\"RX pin (setup)\"},"
+            "\"baud\":{\"type\":\"integer\",\"description\":\"Baud rate, default 115200\"},"
+            "\"data\":{\"type\":\"string\",\"description\":\"Text to send (write)\"},"
+            "\"timeout_ms\":{\"type\":\"integer\",\"description\":\"Read timeout, default 500\"},"
+            "\"len\":{\"type\":\"integer\",\"description\":\"Max bytes to read, default 64\"}"
+            "},"
+            "\"required\":[\"op\"]}",
+        .execute = tool_uart_execute,
+    };
+    register_tool(&uart);
+
+    mimi_tool_t adc = {
+        .name = "adc",
+        .description = "Read an analog pin (12-bit, 0-3.3V). ESP32-S3 ADC pins are GPIO1-10 and GPIO11-14.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"pin\":{\"type\":\"integer\",\"description\":\"ADC-capable GPIO, default 4\"},"
+            "\"samples\":{\"type\":\"integer\",\"description\":\"Averaging samples, default 1 (max 32)\"}"
+            "},"
+            "\"required\":[\"pin\"]}",
+        .execute = tool_adc_execute,
+    };
+    register_tool(&adc);
+
+    mimi_tool_t rmt = {
+        .name = "rmt",
+        .description = "Raw RMT timing engine. op=pulse sends an exact level/duration train (infrared, ultrasonic trigger, "
+                       "custom LEDs); op=capture records the edges of an incoming signal (DHT, IR receiver, one-wire) "
+                       "and returns level:microseconds pairs.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"op\":{\"type\":\"string\",\"description\":\"pulse | capture\"},"
+            "\"gpio\":{\"type\":\"integer\",\"description\":\"Signal pin\"},"
+            "\"symbols\":{\"type\":\"array\",\"description\":\"pulse only: [{level:0|1, us:number}, ...]\","
+            "\"items\":{\"type\":\"object\",\"properties\":{\"level\":{\"type\":\"integer\"},\"us\":{\"type\":\"integer\"}}}},"
+            "\"idle_us\":{\"type\":\"integer\",\"description\":\"capture: signal ends after this much silence, default 5000\"},"
+            "\"max_symbols\":{\"type\":\"integer\",\"description\":\"capture: max edges, default 64\"},"
+            "\"timeout_ms\":{\"type\":\"integer\",\"description\":\"capture: wait time, default 200\"}"
+            "},"
+            "\"required\":[\"op\",\"gpio\"]}",
+        .execute = tool_rmt_execute,
+    };
+    register_tool(&rmt);
+
+    /* Register the device table */
+    tool_device_init();
+
+    mimi_tool_t dev_define = {
+        .name = "device_define",
+        .description = "Register or update a named device so later calls can use its name instead of pins. "
+                       "type: ws2812 | servo | gpio | adc | i2c | spi | uart | rmt. "
+                       "Store every extra key the driver needs (pin, count, sda, scl, addr, port, tx, rx, baud...).",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"name\":{\"type\":\"string\",\"description\":\"Short ASCII device name, e.g. led or servo1 (avoid non-ASCII characters)\"},"
+            "\"type\":{\"type\":\"string\",\"description\":\"ws2812 | servo | gpio | adc | i2c | spi | uart | rmt\"}"
+            "},"
+            "\"required\":[\"name\",\"type\"]}",
+        .execute = tool_device_define_execute,
+    };
+    register_tool(&dev_define);
+
+    mimi_tool_t dev_list = {
+        .name = "device_list",
+        .description = "List all defined devices with their type and key pins.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{},"
+            "\"required\":[]}",
+        .execute = tool_device_list_execute,
+    };
+    register_tool(&dev_list);
+
+    mimi_tool_t dev_do = {
+        .name = "device_do",
+        .description = "PREFERRED way to drive hardware: run an action on a named device and skip pin bookkeeping. "
+                       "Actions by type — ws2812: on/off/set(color)/blink/stop; servo: set(angle in value); "
+                       "gpio: on/off/toggle/read; adc: read; i2c: scan/read/write; spi: transfer; "
+                       "uart: setup/write/read; rmt: pulse/capture. Extra keys are passed through.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"name\":{\"type\":\"string\",\"description\":\"Device name from device_list (ASCII)\"},"
+            "\"action\":{\"type\":\"string\",\"description\":\"Action for that device type\"},"
+            "\"value\":{\"description\":\"Generic value: color for ws2812, angle for servo, 0/1 for gpio, text for uart\"},"
+            "\"interval_ms\":{\"type\":\"integer\",\"description\":\"Blink on/off time (ws2812 blink)\"},"
+            "\"cycles\":{\"type\":\"integer\",\"description\":\"Blink cycles, 0 = forever\"}"
+            "},"
+            "\"required\":[\"name\",\"action\"]}",
+        .execute = tool_device_do_execute,
+    };
+    register_tool(&dev_do);
 
     build_tools_json();
 
