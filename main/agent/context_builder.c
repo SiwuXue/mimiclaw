@@ -2,6 +2,9 @@
 #include "mimi_config.h"
 #include "memory/memory_store.h"
 #include "skills/skill_loader.h"
+#include "tools/gpio_policy.h"
+#include "tools/tool_servo.h"
+#include "tools/tool_ws2812.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -50,8 +53,12 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "- gpio_write: Set a GPIO pin HIGH or LOW. Use for controlling LEDs, relays, and digital outputs.\n"
         "- gpio_read: Read a single GPIO pin state (HIGH or LOW). Use for checking switches, buttons, sensors.\n"
         "- gpio_read_all: Read all allowed GPIO pins at once. Good for getting a full status overview.\n"
-        "- ws2812_set: Set the color of WS2812/SK6812 addressable RGB LEDs (default GPIO48 = onboard RGB LED). "
-        "This is the ONLY way to control addressable LEDs: gpio_write cannot light them.\n\n"
+        "- ws2812_set: Set the color of WS2812/SK6812 addressable RGB LEDs. "
+        "This is the ONLY way to control addressable LEDs: gpio_write cannot light them.\n"
+        "- ws2812_blink: Start a persistent blink in the background (on/off loop). "
+        "Call it ONCE when the user asks for 闪烁/blink/flash; the device keeps blinking on its own.\n"
+        "- ws2812_stop: Stop the persistent blink and turn the LEDs off.\n"
+        "- servo_set: Rotate a hobby servo to an angle (0-180). Servos need PWM, so gpio_write cannot drive them.\n\n"
         "When using cron_add for Telegram delivery, always set channel='telegram' and a valid numeric chat_id.\n\n"
         "## GPIO\n"
         "You can control hardware GPIO pins on the ESP32-S3. Use gpio_read to check switch/sensor states "
@@ -73,6 +80,40 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "Skills are specialized instruction files stored in " MIMI_SKILLS_PREFIX ".\n"
         "When a task matches a skill, read the full skill file for detailed instructions.\n"
         "You can create new skills using write_file to " MIMI_SKILLS_PREFIX "<name>.md.\n");
+
+    /* Hardware wiring summary (values come from NVS, never hard-coded) */
+    {
+        int led_gpio = 48, led_count = 1;
+        int servo_gpio = 0, servo_min = 500, servo_max = 2500;
+        char allow[160] = {0};
+
+        ws2812_get_config(&led_gpio, &led_count);
+        servo_get_config(&servo_gpio, &servo_min, &servo_max);
+        gpio_policy_get_allowlist(allow, sizeof(allow));
+
+        if (off + 1 < size) {
+            if (servo_gpio > 0) {
+                off += snprintf(buf + off, size - off,
+                    "\n## Hardware Wiring\n"
+                    "- WS2812 LED data pin: GPIO%d (%d LED(s)). Call ws2812_set without gpio to use this default.\n"
+                    "- Servo signal pin: GPIO%d (pulse %d-%d us). Call servo_set without gpio to use this default.\n"
+                    "- Allowed GPIO pins: %s\n"
+                    "If the user's hardware is wired to another pin, pass that gpio explicitly. "
+                    "If the pin is rejected, tell the user to run `set_gpio_allow <csv>` on the serial CLI.\n",
+                    led_gpio, led_count, servo_gpio, servo_min, servo_max, allow);
+            } else {
+                off += snprintf(buf + off, size - off,
+                    "\n## Hardware Wiring\n"
+                    "- WS2812 LED data pin: GPIO%d (%d LED(s)). Call ws2812_set without gpio to use this default.\n"
+                    "- Servo: no pin configured yet. Ask the user which pin the servo signal wire uses, "
+                    "then tell them to run `set_servo <gpio>` on the serial CLI.\n"
+                    "- Allowed GPIO pins: %s\n"
+                    "If the user's hardware is wired to another pin, pass that gpio explicitly. "
+                    "If the pin is rejected, tell the user to run `set_gpio_allow <csv>` on the serial CLI.\n",
+                    led_gpio, led_count, allow);
+            }
+        }
+    }
 
     /* Bootstrap files */
     off = append_file(buf, size, off, MIMI_SOUL_FILE, "Personality");

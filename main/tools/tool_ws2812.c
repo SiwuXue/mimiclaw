@@ -1,11 +1,16 @@
 #include "tools/tool_ws2812.h"
 #include "tools/gpio_policy.h"
+#include "mimi_config.h"
 
 #include "driver/rmt_tx.h"
 #include "driver/rmt_encoder.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "nvs.h"
 #include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -27,6 +32,80 @@ static const char *TAG = "ws2812";
 static rmt_channel_handle_t s_chan = NULL;
 static rmt_encoder_handle_t s_copy_encoder = NULL;
 static int s_chan_gpio = -1;
+
+/* Reused bitstream buffer (PSRAM) so blinking does not churn the heap */
+static rmt_symbol_word_t *s_symbols = NULL;
+static size_t s_symbols_cap = 0;
+
+/* Serializes RMT access between the tool calls and the blink task */
+static SemaphoreHandle_t s_rmt_lock = NULL;
+
+/* Background blink task state */
+static TaskHandle_t s_blink_task = NULL;
+static volatile bool s_blink_active = false;
+static int s_blink_gpio = 48;
+static int s_blink_count = 1;
+static int s_blink_interval_ms = 500;   /* on time and off time, each */
+static int s_blink_cycles = 0;      /* 0 = forever */
+static uint8_t s_blink_r = 255;
+static uint8_t s_blink_g = 255;
+static uint8_t s_blink_b = 255;
+
+/* Defaults, overridable through NVS (set_led / set_led in CLI) */
+static int s_cfg_gpio = 48;
+static int s_cfg_count = 1;
+
+static void ws2812_load_config(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(MIMI_NVS_HW, NVS_READONLY, &nvs) != ESP_OK) {
+        return;
+    }
+    uint32_t value = 0;
+    if (nvs_get_u32(nvs, MIMI_NVS_KEY_LED_GPIO, &value) == ESP_OK && value > 0) {
+        s_cfg_gpio = (int)value;
+    }
+    if (nvs_get_u32(nvs, MIMI_NVS_KEY_LED_COUNT, &value) == ESP_OK && value > 0) {
+        s_cfg_count = (int)value;
+    }
+    nvs_close(nvs);
+}
+
+esp_err_t ws2812_set_config(int gpio, int count)
+{
+    if (!gpio_policy_pin_is_allowed(gpio)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (count < 1 || count > WS2812_MAX_PIXELS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(MIMI_NVS_HW, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u32(nvs, MIMI_NVS_KEY_LED_GPIO, (uint32_t)gpio);
+    if (err == ESP_OK) {
+        err = nvs_set_u32(nvs, MIMI_NVS_KEY_LED_COUNT, (uint32_t)count);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+
+    if (err == ESP_OK) {
+        s_cfg_gpio = gpio;
+        s_cfg_count = count;
+    }
+    return err;
+}
+
+void ws2812_get_config(int *gpio, int *count)
+{
+    if (gpio) *gpio = s_cfg_gpio;
+    if (count) *count = s_cfg_count;
+}
 
 static void ws2812_close(void)
 {
@@ -79,6 +158,201 @@ static bool ws2812_open(int gpio)
     s_chan_gpio = gpio;
     ESP_LOGI(TAG, "RMT channel ready on GPIO%d", gpio);
     return true;
+}
+
+static bool parse_color(const char *spec, uint8_t *r, uint8_t *g, uint8_t *b);
+
+static bool ensure_symbols(int count)
+{
+    size_t need = (size_t)count * 24 + 1;
+    if (s_symbols && s_symbols_cap >= need) {
+        return true;
+    }
+    if (s_symbols) {
+        heap_caps_free(s_symbols);
+        s_symbols = NULL;
+        s_symbols_cap = 0;
+    }
+
+    s_symbols = heap_caps_calloc(need, sizeof(rmt_symbol_word_t),
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_symbols) {
+        return false;
+    }
+    s_symbols_cap = need;
+    return true;
+}
+
+/* Push one solid-color frame to the LED chain. Caller must NOT hold s_rmt_lock. */
+static esp_err_t ws2812_transmit(int gpio, int count, uint8_t r, uint8_t g, uint8_t b,
+                                 char *output, size_t output_size)
+{
+    if (!s_rmt_lock) {
+        s_rmt_lock = xSemaphoreCreateMutex();
+    }
+    if (s_rmt_lock && xSemaphoreTake(s_rmt_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        snprintf(output, output_size, "Error: WS2812 bus busy");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = ESP_OK;
+
+    if (!ws2812_open(gpio)) {
+        snprintf(output, output_size, "Error: failed to init RMT on GPIO%d", gpio);
+        err = ESP_FAIL;
+        goto done;
+    }
+    if (!ensure_symbols(count)) {
+        snprintf(output, output_size, "Error: out of memory");
+        err = ESP_ERR_NO_MEM;
+        goto done;
+    }
+
+    size_t idx = 0;
+    for (int px = 0; px < count; px++) {
+        /* WS2812 expects GRB order, MSB first */
+        uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;
+        for (int bit = 23; bit >= 0; bit--) {
+            bool one = ((grb >> bit) & 0x1) != 0;
+            s_symbols[idx].level0 = 1;
+            s_symbols[idx].duration0 = one ? WS2812_T1H_TICKS : WS2812_T0H_TICKS;
+            s_symbols[idx].level1 = 0;
+            s_symbols[idx].duration1 = one ? WS2812_T1L_TICKS : WS2812_T0L_TICKS;
+            idx++;
+        }
+    }
+    s_symbols[idx].level0 = 0;
+    s_symbols[idx].duration0 = WS2812_RESET_TICKS;
+    s_symbols[idx].level1 = 0;
+    s_symbols[idx].duration1 = 0;
+    idx++;
+
+    rmt_transmit_config_t tx_cfg = {
+        .loop_count = 0,
+    };
+    err = rmt_transmit(s_chan, s_copy_encoder, s_symbols,
+                       idx * sizeof(rmt_symbol_word_t), &tx_cfg);
+    if (err == ESP_OK) {
+        err = rmt_tx_wait_all_done(s_chan, 100);
+    }
+    if (err != ESP_OK) {
+        snprintf(output, output_size, "Error: RMT transmit failed (%d)", (int)err);
+        err = ESP_FAIL;
+    }
+
+done:
+    if (s_rmt_lock) {
+        xSemaphoreGive(s_rmt_lock);
+    }
+    return err;
+}
+
+static void ws2812_blink_task(void *arg)
+{
+    (void)arg;
+    int cycles = 0;
+
+    while (s_blink_active && (s_blink_cycles == 0 || cycles < s_blink_cycles)) {
+        char msg[64];
+
+        ws2812_transmit(s_blink_gpio, s_blink_count, s_blink_r, s_blink_g, s_blink_b,
+                        msg, sizeof(msg));
+
+        /* Sleep in slices so ws2812_blink_stop() reacts quickly */
+        int remain = s_blink_interval_ms;
+        while (remain > 0 && s_blink_active) {
+            int step = remain > 50 ? 50 : remain;
+            vTaskDelay(pdMS_TO_TICKS(step));
+            remain -= step;
+        }
+        if (!s_blink_active) {
+            break;
+        }
+
+        ws2812_transmit(s_blink_gpio, s_blink_count, 0, 0, 0, msg, sizeof(msg));
+
+        remain = s_blink_interval_ms;
+        while (remain > 0 && s_blink_active) {
+            int step = remain > 50 ? 50 : remain;
+            vTaskDelay(pdMS_TO_TICKS(step));
+            remain -= step;
+        }
+        cycles++;
+    }
+
+    /* Leave the LED off when the blink finishes */
+    char msg[64];
+    ws2812_transmit(s_blink_gpio, s_blink_count, 0, 0, 0, msg, sizeof(msg));
+    ESP_LOGI(TAG, "Blink task finished after %d cycle(s)", cycles);
+
+    s_blink_task = NULL;
+    vTaskDelete(NULL);
+}
+
+void ws2812_blink_stop(void)
+{
+    if (!s_blink_active && !s_blink_task) {
+        return;
+    }
+    s_blink_active = false;
+
+    /* The task wakes up at least every 50 ms and turns the LED off on exit */
+    for (int i = 0; i < 20 && s_blink_task; i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    s_blink_active = false;
+    ESP_LOGI(TAG, "Blink stopped");
+}
+
+esp_err_t ws2812_blink_start(int gpio, int count, const char *color, int brightness,
+                             int interval_ms, int cycles,
+                             char *output, size_t output_size)
+{
+    uint8_t r = 0, g = 0, b = 0;
+
+    if (!gpio_policy_pin_is_allowed(gpio)) {
+        if (gpio_policy_pin_forbidden_hint(gpio, output, output_size)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        snprintf(output, output_size, "Error: pin %d is not allowed for WS2812 output", gpio);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (count < 1 || count > WS2812_MAX_PIXELS) {
+        snprintf(output, output_size, "Error: count must be 1-%d", WS2812_MAX_PIXELS);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!parse_color(color, &r, &g, &b)) {
+        snprintf(output, output_size, "Error: unknown color '%s'", color ? color : "");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (interval_ms < 50) interval_ms = 50;
+    if (brightness < 0) brightness = 0;
+    if (brightness > 255) brightness = 255;
+
+    s_blink_r = (uint8_t)((r * brightness) / 255);
+    s_blink_g = (uint8_t)((g * brightness) / 255);
+    s_blink_b = (uint8_t)((b * brightness) / 255);
+    s_blink_gpio = gpio;
+    s_blink_count = count;
+    s_blink_interval_ms = interval_ms;
+    s_blink_cycles = cycles;
+
+    ws2812_blink_stop();
+
+    s_blink_active = true;
+    if (xTaskCreate(ws2812_blink_task, "ws2812_blink", 3072, NULL, 4, &s_blink_task) != pdPASS) {
+        s_blink_active = false;
+        snprintf(output, output_size, "Error: failed to start blink task (out of memory)");
+        return ESP_ERR_NO_MEM;
+    }
+
+    snprintf(output, output_size,
+             "Blinking %d WS2812 LED(s) on GPIO%d (#%02X%02X%02X), on/off every %d ms%s",
+             count, gpio, s_blink_r, s_blink_g, s_blink_b, interval_ms,
+             cycles == 0 ? " until stopped" : "");
+    ESP_LOGI(TAG, "blink start: gpio=%d count=%d interval=%dms cycles=%d",
+             gpio, count, interval_ms, cycles);
+    return ESP_OK;
 }
 
 static bool parse_hex_color(const char *s, uint8_t *r, uint8_t *g, uint8_t *b)
@@ -191,51 +465,12 @@ esp_err_t ws2812_set_pixels(int gpio, int count, const char *color, int brightne
     g = (uint8_t)((g * brightness) / 255);
     b = (uint8_t)((b * brightness) / 255);
 
-    if (!ws2812_open(gpio)) {
-        snprintf(output, output_size, "Error: failed to init RMT on GPIO%d", gpio);
-        return ESP_FAIL;
-    }
+    /* A fixed color overrides a running blink */
+    ws2812_blink_stop();
 
-    size_t symbol_count = (size_t)count * 24 + 1;  /* +1 for the reset pulse */
-    rmt_symbol_word_t *symbols = heap_caps_calloc(symbol_count, sizeof(rmt_symbol_word_t),
-                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!symbols) {
-        snprintf(output, output_size, "Error: out of memory");
-        return ESP_ERR_NO_MEM;
-    }
-
-    size_t idx = 0;
-    for (int px = 0; px < count; px++) {
-        /* WS2812 expects GRB order, MSB first */
-        uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;
-        for (int bit = 23; bit >= 0; bit--) {
-            bool one = ((grb >> bit) & 0x1) != 0;
-            symbols[idx].level0 = 1;
-            symbols[idx].duration0 = one ? WS2812_T1H_TICKS : WS2812_T0H_TICKS;
-            symbols[idx].level1 = 0;
-            symbols[idx].duration1 = one ? WS2812_T1L_TICKS : WS2812_T0L_TICKS;
-            idx++;
-        }
-    }
-    symbols[idx].level0 = 0;
-    symbols[idx].duration0 = WS2812_RESET_TICKS;
-    symbols[idx].level1 = 0;
-    symbols[idx].duration1 = 0;
-    idx++;
-
-    rmt_transmit_config_t tx_cfg = {
-        .loop_count = 0,
-    };
-    esp_err_t err = rmt_transmit(s_chan, s_copy_encoder, symbols,
-                                 idx * sizeof(rmt_symbol_word_t), &tx_cfg);
-    if (err == ESP_OK) {
-        err = rmt_tx_wait_all_done(s_chan, 100);
-    }
-    heap_caps_free(symbols);
-
+    esp_err_t err = ws2812_transmit(gpio, count, r, g, b, output, output_size);
     if (err != ESP_OK) {
-        snprintf(output, output_size, "Error: RMT transmit failed (%d)", (int)err);
-        return ESP_FAIL;
+        return err;
     }
 
     snprintf(output, output_size, "Set %d WS2812 LED(s) on GPIO%d to #%02X%02X%02X (brightness %d)",
@@ -253,8 +488,8 @@ esp_err_t tool_ws2812_set_execute(const char *input_json, char *output, size_t o
         return ESP_ERR_INVALID_ARG;
     }
 
-    int gpio = 48;
-    int count = 1;
+    int gpio = s_cfg_gpio;
+    int count = s_cfg_count;
     int brightness = 255;
     char color[32] = "white";
 
@@ -275,9 +510,61 @@ esp_err_t tool_ws2812_set_execute(const char *input_json, char *output, size_t o
     return err;
 }
 
+esp_err_t tool_ws2812_blink_execute(const char *input_json, char *output, size_t output_size)
+{
+    cJSON *root = cJSON_Parse(input_json ? input_json : "{}");
+    if (!root) {
+        snprintf(output, output_size, "Error: invalid JSON input");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int gpio = s_cfg_gpio;
+    int count = s_cfg_count;
+    int brightness = 255;
+    int interval_ms = s_blink_interval_ms;
+    int cycles = 0;
+    char color[32] = "white";
+
+    cJSON *pin_obj = cJSON_GetObjectItem(root, "gpio");
+    cJSON *count_obj = cJSON_GetObjectItem(root, "count");
+    cJSON *color_obj = cJSON_GetObjectItem(root, "color");
+    cJSON *bright_obj = cJSON_GetObjectItem(root, "brightness");
+    cJSON *interval_obj = cJSON_GetObjectItem(root, "interval_ms");
+    cJSON *cycles_obj = cJSON_GetObjectItem(root, "cycles");
+
+    if (cJSON_IsNumber(pin_obj)) gpio = (int)pin_obj->valuedouble;
+    if (cJSON_IsNumber(count_obj)) count = (int)count_obj->valuedouble;
+    if (cJSON_IsNumber(bright_obj)) brightness = (int)bright_obj->valuedouble;
+    if (cJSON_IsNumber(interval_obj)) interval_ms = (int)interval_obj->valuedouble;
+    if (cJSON_IsNumber(cycles_obj)) cycles = (int)cycles_obj->valuedouble;
+    if (cJSON_IsString(color_obj) && color_obj->valuestring) {
+        snprintf(color, sizeof(color), "%s", color_obj->valuestring);
+    }
+
+    esp_err_t err = ws2812_blink_start(gpio, count, color, brightness,
+                                       interval_ms, cycles, output, output_size);
+    cJSON_Delete(root);
+    return err;
+}
+
+esp_err_t tool_ws2812_stop_execute(const char *input_json, char *output, size_t output_size)
+{
+    (void)input_json;
+    ws2812_blink_stop();
+
+    char msg[64];
+    if (ws2812_transmit(s_cfg_gpio, s_cfg_count, 0, 0, 0, msg, sizeof(msg)) != ESP_OK) {
+        snprintf(output, output_size, "Blink stopped, but failed to turn the LED off: %s", msg);
+        return ESP_FAIL;
+    }
+    snprintf(output, output_size, "Blink stopped, LED on GPIO%d is off", s_cfg_gpio);
+    return ESP_OK;
+}
+
 esp_err_t tool_ws2812_init(void)
 {
-    ESP_LOGI(TAG, "WS2812 tool initialized (default GPIO48, max %d LEDs)",
-             WS2812_MAX_PIXELS);
+    ws2812_load_config();
+    ESP_LOGI(TAG, "WS2812 tool initialized (GPIO%d, %d LED(s), max %d)",
+             s_cfg_gpio, s_cfg_count, WS2812_MAX_PIXELS);
     return ESP_OK;
 }

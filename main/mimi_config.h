@@ -160,6 +160,15 @@
 #define MIMI_NVS_KEY_PROXY_PORT      "port"
 #define MIMI_NVS_KEY_PROXY_TYPE      "proxy_type"
 
+/* Hardware Configuration (LED / servo / GPIO policy) */
+#define MIMI_NVS_HW                 "hw_config"
+#define MIMI_NVS_KEY_LED_GPIO       "led_gpio"
+#define MIMI_NVS_KEY_LED_COUNT      "led_count"
+#define MIMI_NVS_KEY_SERVO_GPIO     "servo_gpio"
+#define MIMI_NVS_KEY_SERVO_MIN_US   "servo_min_us"
+#define MIMI_NVS_KEY_SERVO_MAX_US   "servo_max_us"
+#define MIMI_NVS_KEY_GPIO_ALLOW     "gpio_allow"
+
 /* WiFi Onboarding (Captive Portal) */
 #define MIMI_ONBOARD_AP_PREFIX    "MimiClaw-"
 #define MIMI_ONBOARD_AP_PASS      ""          /* open network */

@@ -13,8 +13,10 @@ static const char *TAG = "tool_gpio";
 
 esp_err_t tool_gpio_init(void)
 {
-    ESP_LOGI(TAG, "GPIO tool initialized (pin range %d-%d)",
-             MIMI_GPIO_MIN_PIN, MIMI_GPIO_MAX_PIN);
+    gpio_policy_init();
+    char allow[160];
+    gpio_policy_get_allowlist(allow, sizeof(allow));
+    ESP_LOGI(TAG, "GPIO tool initialized (allowed pins: %s)", allow);
     return ESP_OK;
 }
 
@@ -48,8 +50,9 @@ esp_err_t tool_gpio_write_execute(const char *input_json, char *output, size_t o
             cJSON_Delete(root);
             return ESP_ERR_INVALID_ARG;
         }
-        if (MIMI_GPIO_ALLOWED_CSV[0] != '\0') {
-            snprintf(output, output_size, "Error: pin %d is not in allowed list", pin);
+        char allow[160];
+        if (gpio_policy_get_allowlist(allow, sizeof(allow))) {
+            snprintf(output, output_size, "Error: pin %d is not in allowed list (%s)", pin, allow);
         } else {
             snprintf(output, output_size, "Error: pin must be %d-%d",
                      MIMI_GPIO_MIN_PIN, MIMI_GPIO_MAX_PIN);
@@ -94,8 +97,9 @@ esp_err_t tool_gpio_read_execute(const char *input_json, char *output, size_t ou
             cJSON_Delete(root);
             return ESP_ERR_INVALID_ARG;
         }
-        if (MIMI_GPIO_ALLOWED_CSV[0] != '\0') {
-            snprintf(output, output_size, "Error: pin %d is not in allowed list", pin);
+        char allow[160];
+        if (gpio_policy_get_allowlist(allow, sizeof(allow))) {
+            snprintf(output, output_size, "Error: pin %d is not in allowed list (%s)", pin, allow);
         } else {
             snprintf(output, output_size, "Error: pin must be %d-%d",
                      MIMI_GPIO_MIN_PIN, MIMI_GPIO_MAX_PIN);
@@ -132,9 +136,10 @@ esp_err_t tool_gpio_read_all_execute(const char *input_json, char *output, size_
     cursor += (size_t)written;
     remaining -= (size_t)written;
 
-    if (MIMI_GPIO_ALLOWED_CSV[0] != '\0') {
+    static char allow[160];
+    if (gpio_policy_get_allowlist(allow, sizeof(allow)) && allow[0] != '\0') {
         /* Iterate over explicit allowlist */
-        const char *csv_cursor = MIMI_GPIO_ALLOWED_CSV;
+        const char *csv_cursor = allow;
         while (*csv_cursor != '\0') {
             char *endptr = NULL;
             long value;

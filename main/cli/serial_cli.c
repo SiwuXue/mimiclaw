@@ -9,6 +9,8 @@
 #include "proxy/http_proxy.h"
 #include "tools/tool_registry.h"
 #include "tools/tool_ws2812.h"
+#include "tools/tool_servo.h"
+#include "tools/gpio_policy.h"
 #include "tools/tool_web_search.h"
 #include "cron/cron_service.h"
 #include "heartbeat/heartbeat.h"
@@ -211,8 +213,16 @@ static int cmd_led(int argc, char **argv)
         return 1;
     }
 
-    int gpio = led_args.gpio->count ? led_args.gpio->ival[0] : 48;
-    int count = led_args.count->count ? led_args.count->ival[0] : 1;
+    int gpio = -1;
+    int count = -1;
+    if (led_args.gpio->count) gpio = led_args.gpio->ival[0];
+    if (led_args.count->count) count = led_args.count->ival[0];
+    if (gpio < 0 || count < 0) {
+        int cfg_gpio = 48, cfg_count = 1;
+        ws2812_get_config(&cfg_gpio, &cfg_count);
+        if (gpio < 0) gpio = cfg_gpio;
+        if (count < 0) count = cfg_count;
+    }
     const char *color = led_args.color->sval[0];
 
     char out[160];
@@ -221,6 +231,114 @@ static int cmd_led(int argc, char **argv)
         return 0;
     }
     printf("%s\n", out);
+    return 1;
+}
+
+/* --- set_led command --- */
+static struct {
+    struct arg_int *gpio;
+    struct arg_int *count;
+    struct arg_end *end;
+} set_led_args;
+
+static int cmd_set_led(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&set_led_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, set_led_args.end, argv[0]);
+        return 1;
+    }
+
+    int gpio = set_led_args.gpio->ival[0];
+    int count = set_led_args.count->count ? set_led_args.count->ival[0] : 1;
+
+    if (ws2812_set_config(gpio, count) == ESP_OK) {
+        printf("WS2812 default saved: GPIO%d, %d LED(s)\n", gpio, count);
+        return 0;
+    }
+    printf("Failed: pin %d not allowed (see set_gpio_allow) or invalid LED count\n", gpio);
+    return 1;
+}
+
+/* --- servo command --- */
+static struct {
+    struct arg_int *angle;
+    struct arg_int *gpio;
+    struct arg_end *end;
+} servo_args;
+
+static int cmd_servo(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&servo_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, servo_args.end, argv[0]);
+        return 1;
+    }
+
+    int gpio = servo_args.gpio->count ? servo_args.gpio->ival[0] : -1;
+    int angle = servo_args.angle->ival[0];
+
+    char out[160];
+    if (servo_set_angle(gpio, angle, out, sizeof(out)) == ESP_OK) {
+        printf("%s\n", out);
+        return 0;
+    }
+    printf("%s\n", out);
+    return 1;
+}
+
+/* --- set_servo command --- */
+static struct {
+    struct arg_int *gpio;
+    struct arg_int *min_us;
+    struct arg_int *max_us;
+    struct arg_end *end;
+} set_servo_args;
+
+static int cmd_set_servo(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&set_servo_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, set_servo_args.end, argv[0]);
+        return 1;
+    }
+
+    int gpio = set_servo_args.gpio->ival[0];
+    int min_us = set_servo_args.min_us->count ? set_servo_args.min_us->ival[0] : 500;
+    int max_us = set_servo_args.max_us->count ? set_servo_args.max_us->ival[0] : 2500;
+
+    if (servo_set_config(gpio, min_us, max_us) == ESP_OK) {
+        printf("Servo default saved: GPIO%d, %d-%d us\n", gpio, min_us, max_us);
+        return 0;
+    }
+    printf("Failed: pin %d not allowed or invalid pulse range\n", gpio);
+    return 1;
+}
+
+/* --- set_gpio_allow command --- */
+static struct {
+    struct arg_str *csv;
+    struct arg_end *end;
+} gpio_allow_args;
+
+static int cmd_set_gpio_allow(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&gpio_allow_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, gpio_allow_args.end, argv[0]);
+        return 1;
+    }
+
+    const char *csv = gpio_allow_args.csv->sval[0];
+    if (gpio_policy_set_allowlist(csv) == ESP_OK) {
+        if (csv[0]) {
+            printf("GPIO allowlist saved: %s\n", csv);
+        } else {
+            printf("GPIO allowlist cleared, using built-in default.\n");
+        }
+        return 0;
+    }
+    printf("Failed to save GPIO allowlist.\n");
     return 1;
 }
 
@@ -621,6 +739,25 @@ static int cmd_config_show(int argc, char **argv)
     print_config_u16("Proxy Port", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_PORT, MIMI_SECRET_PROXY_PORT);
     print_config("Search Key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_API_KEY,  MIMI_SECRET_SEARCH_KEY, true);
     print_config("Tavily Key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_TAVILY_KEY, MIMI_SECRET_TAVILY_KEY, true);
+
+    /* Hardware wiring */
+    {
+        int led_gpio = 48, led_count = 1;
+        int servo_gpio = 0, servo_min = 500, servo_max = 2500;
+        char allow[160] = {0};
+
+        ws2812_get_config(&led_gpio, &led_count);
+        servo_get_config(&servo_gpio, &servo_min, &servo_max);
+        gpio_policy_get_allowlist(allow, sizeof(allow));
+
+        printf("  %-14s: GPIO%d, %d LED(s)\n", "WS2812", led_gpio, led_count);
+        if (servo_gpio > 0) {
+            printf("  %-14s: GPIO%d, %d-%d us\n", "Servo", servo_gpio, servo_min, servo_max);
+        } else {
+            printf("  %-14s: (not configured)\n", "Servo");
+        }
+        printf("  %-14s: %s\n", "GPIO allowlist", allow);
+    }
     printf("=============================\n");
     return 0;
 }
@@ -974,6 +1111,54 @@ esp_err_t serial_cli_init(void)
         .argtable = &led_args,
     };
     esp_console_cmd_register(&led_cmd);
+
+    /* set_led */
+    set_led_args.gpio = arg_int1(NULL, NULL, "<gpio>", "WS2812 data pin");
+    set_led_args.count = arg_int0(NULL, NULL, "[count]", "LED count (default 1)");
+    set_led_args.end = arg_end(2);
+    esp_console_cmd_t set_led_cmd = {
+        .command = "set_led",
+        .help = "Set the default WS2812 pin/count, e.g. set_led 48 1",
+        .func = &cmd_set_led,
+        .argtable = &set_led_args,
+    };
+    esp_console_cmd_register(&set_led_cmd);
+
+    /* servo */
+    servo_args.angle = arg_int1(NULL, NULL, "<angle>", "Angle 0-180");
+    servo_args.gpio = arg_int0(NULL, NULL, "[gpio]", "Signal pin (default: configured pin)");
+    servo_args.end = arg_end(2);
+    esp_console_cmd_t servo_cmd = {
+        .command = "servo",
+        .help = "Move a servo: servo <angle> [gpio], e.g. servo 45",
+        .func = &cmd_servo,
+        .argtable = &servo_args,
+    };
+    esp_console_cmd_register(&servo_cmd);
+
+    /* set_servo */
+    set_servo_args.gpio = arg_int1(NULL, NULL, "<gpio>", "Servo signal pin");
+    set_servo_args.min_us = arg_int0(NULL, NULL, "[min_us]", "Min pulse, default 500");
+    set_servo_args.max_us = arg_int0(NULL, NULL, "[max_us]", "Max pulse, default 2500");
+    set_servo_args.end = arg_end(3);
+    esp_console_cmd_t set_servo_cmd = {
+        .command = "set_servo",
+        .help = "Set the default servo pin/pulse range, e.g. set_servo 18 500 2500",
+        .func = &cmd_set_servo,
+        .argtable = &set_servo_args,
+    };
+    esp_console_cmd_register(&set_servo_cmd);
+
+    /* set_gpio_allow */
+    gpio_allow_args.csv = arg_str1(NULL, NULL, "<csv>", "Comma separated pin list, \"\" to reset");
+    gpio_allow_args.end = arg_end(1);
+    esp_console_cmd_t gpio_allow_cmd = {
+        .command = "set_gpio_allow",
+        .help = "Replace the GPIO allowlist, e.g. set_gpio_allow 1,2,3,4,48",
+        .func = &cmd_set_gpio_allow,
+        .argtable = &gpio_allow_args,
+    };
+    esp_console_cmd_register(&gpio_allow_cmd);
 
     /* skill_list */
     esp_console_cmd_t skill_list_cmd = {

@@ -6,6 +6,7 @@
 #include "tools/tool_cron.h"
 #include "tools/tool_gpio.h"
 #include "tools/tool_ws2812.h"
+#include "tools/tool_servo.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -13,7 +14,7 @@
 
 static const char *TAG = "tools";
 
-#define MAX_TOOLS 16
+#define MAX_TOOLS 20
 
 static mimi_tool_t s_tools[MAX_TOOLS];
 static int s_tool_count = 0;
@@ -220,14 +221,14 @@ esp_err_t tool_registry_init(void)
 
     mimi_tool_t ws2812 = {
         .name = "ws2812_set",
-        .description = "Drive WS2812/SK6812 addressable RGB LEDs (including the onboard RGB LED on GPIO48). "
-                       "Sets all LEDs to one color. Use this instead of gpio_write for addressable LEDs, "
+        .description = "Drive WS2812/SK6812 addressable RGB LEDs (including onboard RGB LEDs). "
+                       "Sets all LEDs in the chain to one color. Use this instead of gpio_write for addressable LEDs, "
                        "because they need a precise data protocol and a plain HIGH/LOW does nothing.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{"
-            "\"gpio\":{\"type\":\"integer\",\"description\":\"Data pin, usually 48 for the onboard RGB LED\"},"
-            "\"count\":{\"type\":\"integer\",\"description\":\"Number of LEDs in the chain (1-64, default 1)\"},"
+            "\"gpio\":{\"type\":\"integer\",\"description\":\"Data pin. Omit to use the device's configured default pin.\"},"
+            "\"count\":{\"type\":\"integer\",\"description\":\"Number of LEDs in the chain (1-64). Omit to use the configured default.\"},"
             "\"color\":{\"type\":\"string\",\"description\":\"#RRGGBB hex or a name: white, red, green, blue, yellow, cyan, magenta, orange, warm, cool, off\"},"
             "\"brightness\":{\"type\":\"integer\",\"description\":\"0-255, default 255\"}"
             "},"
@@ -235,6 +236,56 @@ esp_err_t tool_registry_init(void)
         .execute = tool_ws2812_set_execute,
     };
     register_tool(&ws2812);
+
+    mimi_tool_t ws2812_blink = {
+        .name = "ws2812_blink",
+        .description = "Start a PERSISTENT blink on WS2812/SK6812 LEDs. The device keeps blinking by itself "
+                       "in the background, so a single call is enough — do NOT call it repeatedly. "
+                       "Use this whenever the user asks for 闪烁/blink/flash/呼吸灯/闪灯. "
+                       "Use ws2812_stop to end it. A plain ws2812_set also ends a running blink.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"gpio\":{\"type\":\"integer\",\"description\":\"Data pin. Omit to use the device's configured default pin.\"},"
+            "\"count\":{\"type\":\"integer\",\"description\":\"Number of LEDs in the chain (1-64). Omit for default.\"},"
+            "\"color\":{\"type\":\"string\",\"description\":\"#RRGGBB hex or a name: white, red, green, blue, yellow, cyan, magenta, orange, warm, cool\"},"
+            "\"brightness\":{\"type\":\"integer\",\"description\":\"0-255, default 255\"},"
+            "\"interval_ms\":{\"type\":\"integer\",\"description\":\"On time and off time in milliseconds, each. 500 = one blink per second. Default 500.\"},"
+            "\"cycles\":{\"type\":\"integer\",\"description\":\"Number of blink cycles, 0 = keep blinking until stopped. Default 0.\"}"
+            "},"
+            "\"required\":[\"color\"]}",
+        .execute = tool_ws2812_blink_execute,
+    };
+    register_tool(&ws2812_blink);
+
+    mimi_tool_t ws2812_stop = {
+        .name = "ws2812_stop",
+        .description = "Stop the persistent blink started by ws2812_blink and turn the LEDs off.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{},"
+            "\"required\":[]}",
+        .execute = tool_ws2812_stop_execute,
+    };
+    register_tool(&ws2812_stop);
+
+    /* Register servo (LEDC PWM) tool */
+    tool_servo_init();
+
+    mimi_tool_t servo = {
+        .name = "servo_set",
+        .description = "Rotate a hobby servo (SG90/MG996R etc.) to an absolute angle using PWM. "
+                       "Angle 0-180 degrees. Use this instead of gpio_write: a servo needs a 50Hz PWM pulse, not a steady level.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"angle\":{\"type\":\"integer\",\"description\":\"Target angle in degrees, 0-180 (90 = center)\"},"
+            "\"gpio\":{\"type\":\"integer\",\"description\":\"Servo signal pin. Omit to use the device's configured default pin.\"}"
+            "},"
+            "\"required\":[\"angle\"]}",
+        .execute = tool_servo_set_execute,
+    };
+    register_tool(&servo);
 
     build_tools_json();
 
