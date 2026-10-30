@@ -5,6 +5,7 @@
 #include "tools/tool_files.h"
 #include "tools/tool_cron.h"
 #include "tools/tool_gpio.h"
+#include "tools/tool_ws2812.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -213,6 +214,27 @@ esp_err_t tool_registry_init(void)
         .execute = tool_gpio_read_all_execute,
     };
     register_tool(&ga);
+
+    /* Register WS2812 (addressable RGB LED) tool */
+    tool_ws2812_init();
+
+    mimi_tool_t ws2812 = {
+        .name = "ws2812_set",
+        .description = "Drive WS2812/SK6812 addressable RGB LEDs (including the onboard RGB LED on GPIO48). "
+                       "Sets all LEDs to one color. Use this instead of gpio_write for addressable LEDs, "
+                       "because they need a precise data protocol and a plain HIGH/LOW does nothing.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"gpio\":{\"type\":\"integer\",\"description\":\"Data pin, usually 48 for the onboard RGB LED\"},"
+            "\"count\":{\"type\":\"integer\",\"description\":\"Number of LEDs in the chain (1-64, default 1)\"},"
+            "\"color\":{\"type\":\"string\",\"description\":\"#RRGGBB hex or a name: white, red, green, blue, yellow, cyan, magenta, orange, warm, cool, off\"},"
+            "\"brightness\":{\"type\":\"integer\",\"description\":\"0-255, default 255\"}"
+            "},"
+            "\"required\":[\"color\"]}",
+        .execute = tool_ws2812_set_execute,
+    };
+    register_tool(&ws2812);
 
     build_tools_json();
 

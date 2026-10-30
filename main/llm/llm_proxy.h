@@ -27,6 +27,12 @@ esp_err_t llm_set_provider(const char *provider);
  */
 esp_err_t llm_set_model(const char *model);
 
+/**
+ * Save the LLM API endpoint URL to NVS (e.g. a custom OpenAI-compatible endpoint).
+ * Pass an empty string to clear the override and fall back to the provider default.
+ */
+esp_err_t llm_set_api_url(const char *url);
+
 /* ── Tool Use Support ──────────────────────────────────────────── */
 
 typedef struct {
